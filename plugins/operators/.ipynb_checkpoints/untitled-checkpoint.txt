@@ -1,0 +1,176 @@
+from airflow import DAG
+from airflow.hooks.postgres_hook import PostgresHook
+from airflow.operators.dummy_operator import DummyOperator
+from airflow.operators.python_operator import PythonOperator
+from airflow.operators import LoadDimensionOperator
+
+import logging
+from datetime import datetime
+from pyspark.sql import SparkSession
+from pyspark.sql.types import TimestampType, StringType, IntegerType
+from pyspark.sql.functions import udf, col, monotonically_increasing_id, when, count, col, isnull
+from pyspark.sql.functions import hour, dayofmonth, dayofweek, month, year, weekofyear, from_unixtime, to_timestamp, date_format
+
+
+
+@udf(IntegerType())
+def convertTime(dateString):
+    if dateString is not None:
+        return int(time.mktime((datetime(1960, 1, 1).date() + timedelta(dateString)).timetuple()))
+    else:
+        return None
+    
+get_timestamp = udf(lambda x : datetime.utcfromtimestamp(int(x)), TimestampType())
+
+
+
+def readFilesCSV(file, **kwargs):
+    import pandas as pd
+    df = pd.read_csv(file, **kwargs)
+    return df
+
+def cleanerAirportus(**kwargs):
+    #'/home/user/workspace/static_data/COUNTRIES.csv'
+    df_airportus = readFilesCSV( kwargs['fileCsv'], encoding="ISO-8859-1")
+    df_airportus = df_airportus.drop(['continent','ident'],axis=1).loc[(df_airportus.type.isin(['small_airport','medium_airport','large_airport'])
+                                                                        & df_airportus.iso_country.isin(['US'])), ['iata_code', 'name', 'type',
+                                                                                                                   'elevation_ft','iso_country','iso_region',
+                                                                                                                   'municipality', 'gps_code','local_code',
+                                                                                                                   'coordinates']].dropna(how='all',subset=['iata_code'])
+    return {'data': df_airportus.values, 'count': df_airportus.shape[0]}
+
+
+def cleanerPopulation(**kwargs):
+    #'/home/user/workspace/static_data/COUNTRIES.csv'
+    df_population = readFilesCSV( kwargs['fileCsv'], sep=';', encoding="ISO-8859-1")
+    df_population = df_population.loc[(~df_population['Male Population'].isnull() | ~df_population['Female Population'].isnull()),
+                                            ['State Code','City','State','Median Age','Male Population','Female Population',
+                                             'Total Population','Number of Veterans','Foreign-born','Average Household Size']] \
+    .drop_duplicates().fillna(value={'Number of Veterans': 0, 'Foreign-born': 0, 'Average Household Size': 0}).copy()
+    return {'data': df_population.values, 'count': df_population.shape[0]}
+
+
+def cleanerCountry(**kwargs):
+    import csv
+    df_country = readFilesCSV( kwargs['fileCsv'], sep=';',quoting=csv.QUOTE_NONE)
+    return {'data': df_country.values, 'count': df_country.shape[0]}
+
+def cleanerVisa(**kwargs):
+    import csv
+    df_country = readFilesCSV( kwargs['fileCsv'], sep=';',quoting=csv.QUOTE_NONE)
+    return {'data': df_country.values, 'count': df_country.shape[0]}
+    
+def cleannerImmigration(**kwargs):
+    spark = SparkSession.builder.\
+    config('spark.jars.packages','org.apache.hadoop:hadoop-aws:2.7.0,saurfang:spark-sas7bdat:2.1.0-s_2.11').\
+    enableHiveSupport().getOrCreate()
+    df_spark = spark.read.format('com.github.saurfang.sas.spark').load(kwargs['fileSAS'])
+    df_spark.write.parquet("/tmp/sas_data",mode='overwrite')
+    df_spark = spark.read.parquet("/tmp/sas_data")
+    df_spark.selectExpr('cast(cicid AS int) as cicid', ' cast(i94yr AS int) as i94yr',' cast(i94mon AS int) as i94mon','cast(i94cit AS int) as i94cit','cast(i94res AS int) as i94res','i94port',
+                'cast(arrdate AS int) as arrdate','cast(i94mode AS int)i94mode',
+                'i94addr','cast(depdate AS int) as depdate','cast(i94bir AS int) as i94bir','cast(i94visa AS int) as i94visa','cast(count AS int) as count','dtadfile','visapost','entdepa',
+                'entdepd','matflag','cast(cicid AS int) biryear','dtaddto','gender','airline','cast(admnum AS int) as admnum','fltno',
+                'visatype','start_time').write.parquet("/tmp/immigration_data",mode='overwrite')
+    df_immigration = spark.read.parquet('/tmp/immigration_data')
+    df_immigration.write.parquet(f'{kwargs['s3']}' + "immigration",mode='overwrite')
+    
+
+dag = DAG('python_dag',
+      description='Load and transform data in Redshift with Airflow',
+      start_date = datetime(2020, 11, 21),
+      schedule_interval="@once",
+    )
+
+start_operator = DummyOperator(task_id='Begin_execution',  dag=dag)
+
+cleaner_visa = PythonOperator(task_id='cleaner_visa', python_callable=cleanerVisa, 
+                                 op_kwargs={'fileCsv': '/home/user/workspace/static_data/VISA.csv'})
+cleaner_country = PythonOperator(task_id='cleaner_country', python_callable=cleanerCountry, 
+                                 op_kwargs={'fileCsv': '/home/user/workspace/static_data/COUNTRIES.csv'})
+cleaner_airportus = PythonOperator(task_id='cleaner_airportus', python_callable=cleanerAirportus, 
+                                 op_kwargs={'fileCsv': '/home/user/workspace/airport-codes_csv.csv'})
+cleaner_population = PythonOperator(task_id='cleaner_population', python_callable=cleanerPopulation, 
+                                 op_kwargs={'fileCsv': '/home/user/workspace/us-cities-demographics.csv'})
+
+cleaner_immigration = PythonOperator(task_id='cleaner_immigration', python_callable=cleannerImmigration, 
+                                 op_kwargs={'fileSAS': '/home/user/data/18-83510-I94-Data-2016/i94_apr16_sub.sas7bdat','s3':'s3a://proyectuda/'})
+
+#load
+
+stage_events_to_redshift = StageToRedshiftOperator(
+    task_id='Stage_immigration',
+    dag=dag,
+    redshift_conn_id="redshift",
+    aws_credentials_id="aws_credentials",
+    region = 'us-west-2',
+    table="public.immigration",
+    s3_bucket="s3a://proyectuda/immigration",
+)
+
+
+load_visa_dimension_table = LoadDimensionOperator(
+    task_id='Load_visa_dim_table',
+    dag=dag,
+    redshift_conn_id="redshift",
+    table="public.visa",
+    insertTable = """ INSERT INTO visa (code, description) VALUES(%s, %s);""",
+    taskId = "cleaner_visa",
+    deleteLoad = True,
+    provide_context=True,
+)
+
+load_country_dimension_table = LoadDimensionOperator(
+    task_id='Load_country_dim_table',
+    dag=dag,
+    redshift_conn_id="redshift",
+    table="public.country",
+    insertTable = """INSERT INTO country (code, country) VALUES(%s, %s);""",
+    taskId = "cleaner_country",
+    deleteLoad = True,
+    provide_context=True,
+)
+
+load_airportus_dimension_table = LoadDimensionOperator(
+    task_id='Load_airportus_dim_table',
+    dag=dag,
+    redshift_conn_id="redshift",
+    table="public.airportus",
+    insertTable = """INSERT INTO airportus (iata_code, name, "type", elevation_ft, iso_country, iso_region,
+    municipality, gps_code, local_code, coordinates) VALUES(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);""",
+    taskId = "cleaner_airportus",
+    deleteLoad = True,
+    provide_context=True,
+)
+
+load_population_dimension_table = LoadDimensionOperator(
+    task_id='Load_population_dim_table',
+    dag=dag,
+    redshift_conn_id="redshift",
+    table="public.population",
+    insertTable = """INSERT INTO population (statecode, city, state, medianage, malepopulation, 
+    femalepopulation, totalpopulation, numberofveterans, foreignborn, averagehouseholdsize) 
+    VALUES(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s);""",
+    taskId = "cleaner_population",
+    deleteLoad = True,
+    provide_context=True,
+)
+
+
+#python_task_2 = PythonOperator(task_id='python_task2', python_callable=my_func, provide_context=True,)
+
+end_operator = DummyOperator(task_id='Stop_execution',  dag=dag)
+
+
+start_operator >> cleaner_country
+start_operator >> cleaner_visa
+start_operator >> cleaner_airportus
+start_operator >> cleaner_population
+cleaner_visa >> load_visa_dimension_table 
+cleaner_country >> load_country_dimension_table 
+cleaner_airportus >> load_airportus_dimension_table 
+cleaner_population >> load_population_dimension_table 
+load_visa_dimension_table >> end_operator
+load_population_dimension_table >> end_operator
+load_country_dimension_table >> end_operator
+load_airportus_dimension_table >> end_operator
